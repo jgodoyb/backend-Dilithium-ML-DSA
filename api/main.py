@@ -33,11 +33,17 @@ ALLOWED_ORIGINS = [origin.strip() for origin in FRONTEND_URL.split(",") if origi
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["https://front-dilithium-ml-dsa.vercel.app"],
+    allow_origin_regex=r"http://localhost:\d+",  # Acepta cualquier puerto de localhost
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+async def root():
+    return {"status": "online", "message": "Dilithium ML-DSA API is running"}
+
 
 # load_dotenv() ya fue llamado arriba al importar
 
