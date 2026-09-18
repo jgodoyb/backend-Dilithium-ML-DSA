@@ -131,9 +131,37 @@ def test_flow():
     print(f"Verify API [OK]: Result: {is_valid}")
     assert is_valid == True
     
+    # 4. Test Sign & Verify by Hash (JSON Payload)
+    import hashlib
+    dummy_bytes = b"Dummy PDF Content"
+    doc_hash_hex = hashlib.sha256(dummy_bytes).hexdigest()
+    
+    res_sign_hash = client.post(
+        "/api/sign",
+        headers=auth_headers,
+        json={"document_hash": doc_hash_hex}
+    )
+    assert res_sign_hash.status_code == 200, res_sign_hash.text
+    hash_sig_b64 = res_sign_hash.json()["signature_b64"]
+    print("Sign API via Hash [OK]: Signature generated successfully")
+    
+    res_verify_hash = client.post(
+        "/api/verify",
+        headers=auth_headers,
+        json={
+            "document_hash": doc_hash_hex,
+            "signature_b64": hash_sig_b64,
+            "public_key": pk_b64
+        }
+    )
+    assert res_verify_hash.status_code == 200, res_verify_hash.text
+    assert res_verify_hash.json()["is_valid"] == True
+    print("Verify API via Hash [OK]: Result: True")
+
     # Limpiamos
     os.remove("test.pdf")
-    print("Todos los endpoints integrados con MLDSA funcionan correctamente bajo entorno simulado.")
+    print("Todos los endpoints integrados con MLDSA (archivos y hashes) funcionan correctamente bajo entorno simulado.")
 
 if __name__ == "__main__":
     test_flow()
+
