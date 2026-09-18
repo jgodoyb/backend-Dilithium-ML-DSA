@@ -27,14 +27,37 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Procesar orígenes permitidos desde el .env (soporta múltiples separados por coma)
+# Configuración de Entorno y CORS Dinámico
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "development").lower()
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "")
-ALLOWED_ORIGINS = [origin.strip() for origin in FRONTEND_URL.split(",") if origin.strip()]
+
+# Procesar orígenes permitidos desde el .env limpiando espacios y barras finales
+env_origins = [origin.strip().rstrip("/") for origin in FRONTEND_URL.split(",") if origin.strip()]
+
+if ENVIRONMENT == "production":
+    # Dominio oficial de producción y fallbacks necesarios
+    default_prod_origins = [
+        "https://www.qproofsystems.es",
+        "https://qproofsystems.es",
+        "https://front-dilithium-ml-dsa.vercel.app"
+    ]
+    allowed_origins = list(set(default_prod_origins + env_origins))
+    allowed_regex = None  # En producción NO se aceptan conexiones desde localhost
+else:
+    # Entorno de desarrollo / pruebas
+    default_dev_origins = [
+        "http://localhost:8080",
+        "http://localhost:5173",
+        "http://127.0.0.1:8080",
+        "http://127.0.0.1:5173"
+    ]
+    allowed_origins = list(set(default_dev_origins + env_origins))
+    allowed_regex = r"http://(localhost|127\.0\.0\.1):\d+"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["https://front-dilithium-ml-dsa.vercel.app"],
-    allow_origin_regex=r"http://localhost:\d+",  # Acepta cualquier puerto de localhost
+    allow_origins=allowed_origins,
+    allow_origin_regex=allowed_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,10 +67,6 @@ app.add_middleware(
 async def root():
     return {"status": "online", "message": "Dilithium ML-DSA API is running"}
 
-
-# load_dotenv() ya fue llamado arriba al importar
-
-ENVIRONMENT = os.environ.get("ENVIRONMENT", "production")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 SUPABASE_JWKS_URL = os.environ.get("SUPABASE_JWKS_URL", "")
