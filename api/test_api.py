@@ -158,9 +158,47 @@ def test_flow():
     assert res_verify_hash.json()["is_valid"] == True
     print("Verify API via Hash [OK]: Result: True")
 
+    # 5. Test Verify Batch (Multi-layer PAdES simulation with Anti-N+1 Batch Zero-Trust)
+    # Configuramos el mock de Supabase para responder a .in_() con las identidades encontradas
+    def mock_in_filter(field, values):
+        mock_res = MagicMock()
+        mock_data = []
+        for val in values:
+            if val == "test-user-123":
+                mock_data.append({"user_id": "test-user-123", "public_key": pk_b64})
+        mock_res.execute.return_value = MagicMock(data=mock_data)
+        return mock_res
+
+    mock_table.select.return_value.in_.side_effect = mock_in_filter
+
+    sig_hex = base64.b64decode(hash_sig_b64).hex()
+    batch_payload = {
+        "validations": [
+            {
+                "layer": 1,
+                "document_hash": doc_hash_hex,
+                "signature_hex": sig_hex,
+                "signer_id": "test-user-123"
+            },
+            {
+                "layer": 2,
+                "document_hash": doc_hash_hex,
+                "signature_hex": "deadbeef",
+                "signer_id": "non-existent-user-uuid"
+            }
+        ]
+    }
+    res_batch = client.post("/api/verify-batch", json=batch_payload)
+    assert res_batch.status_code == 200, res_batch.text
+    batch_results = res_batch.json().get("results", [])
+    assert len(batch_results) == 2
+    assert batch_results[0] == {"layer": 1, "is_valid": True}
+    assert batch_results[1] == {"layer": 2, "is_valid": False, "error": "Identity not found"}
+    print(f"Verify Batch API [OK]: Results: {batch_results}")
+
     # Limpiamos
     os.remove("test.pdf")
-    print("Todos los endpoints integrados con MLDSA (archivos y hashes) funcionan correctamente bajo entorno simulado.")
+    print("Todos los endpoints integrados con MLDSA (archivos, hashes y batch Zero-Trust) funcionan correctamente bajo entorno simulado.")
 
 if __name__ == "__main__":
     test_flow()

@@ -17,7 +17,7 @@ from slowapi.errors import RateLimitExceeded
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client, ClientOptions
-from typing import Annotated
+from typing import Annotated, List
 
 from mldsa.mldsa import keygen, hash_sign, hash_verify, hash_sign_digest, hash_verify_digest
 
@@ -172,6 +172,15 @@ class VerifyHashRequest(BaseModel):
     signature_b64: str
     public_key: str
 
+class SignatureValidationItem(BaseModel):
+    layer: int
+    document_hash: str  # Hexadecimal SHA-256
+    signature_hex: str  # Hexadecimal de la firma
+    signer_id: str      # UUID del firmante
+
+class BatchVerifyRequest(BaseModel):
+    validations: List[SignatureValidationItem]
+
 @app.post("/api/sign")
 async def sign_document(
     request: Request,
@@ -281,6 +290,57 @@ async def verify_document(
     except Exception as e:
         print(f"[VERIFY ERROR]: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/verify-batch")
+@limiter.limit("10/minute")
+async def verify_batch(request: Request, body: BatchVerifyRequest):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database client not configured")
+
+    # Optimización Anti N+1: Extraer signer_ids únicos y consultar en lote
+    unique_signer_ids = list({item.signer_id for item in body.validations if item.signer_id})
+    identities_map = {}
+
+    if unique_signer_ids:
+        try:
+            res = supabase.table("crypto_identities").select("user_id, public_key").in_("user_id", unique_signer_ids).execute()
+            if res.data and isinstance(res.data, list):
+                identities_map = {
+                    row["user_id"]: row["public_key"]
+                    for row in res.data
+                    if "user_id" in row and "public_key" in row and row["public_key"]
+                }
+        except Exception as e:
+            print(f"[VERIFY BATCH DB ERROR]: {str(e)}")
+
+    results = []
+    for item in body.validations:
+        try:
+            # Búsqueda O(1) en memoria (Zero-Trust)
+            public_key_b64 = identities_map.get(item.signer_id)
+            if not public_key_b64:
+                results.append({"layer": item.layer, "is_valid": False, "error": "Identity not found"})
+                continue
+
+            pk_bytes = base64.b64decode(public_key_b64)
+            signature_bytes = bytes.fromhex(item.signature_hex)
+            ph_m = parse_hash_to_bytes(item.document_hash)
+
+            # Verificación criptográfica Post-Cuántica ML-DSA con contexto Q-Proof
+            is_valid = hash_verify_digest(
+                pk=pk_bytes,
+                ph_m=ph_m,
+                sigma=signature_bytes,
+                ph_algo="SHA-256",
+                ctx=b"Q-Proof"
+            )
+            results.append({"layer": item.layer, "is_valid": bool(is_valid)})
+        except Exception as e:
+            print(f"[VERIFY BATCH ERROR] Layer {item.layer}: {str(e)}")
+            results.append({"layer": item.layer, "is_valid": False})
+
+    return {"results": results}
 
 if __name__ == "__main__":
     import uvicorn
