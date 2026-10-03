@@ -42,14 +42,13 @@ El sistema implementa de forma nativa desde cero el estándar **ML-DSA (FIPS 204
 
 *   `api/`:
     *   `main.py`: Servidor FastAPI con los endpoints de generación, firma y verificación.
-    *   `test_api.py`: Suite de pruebas automatizadas para simular el comportamiento de la API y validar el flujo completo.
 *   `mldsa/`:
     *   `mldsa.py`: Punto de entrada del módulo criptográfico (expone `keygen`, `sign`, `verify`, `hash_sign`, `hash_verify`).
     *   `constants.py`: Constantes globales del estándar (Q = 8380417, N = 256).
     *   `parameters/`: Definición y registro de parámetros estándar (ML-DSA-44, 65, 87) según FIPS 204.
     *   `core/`, `crypto/`, `decomposition/`, `encoding/`, `ntt/`, `sampling/`, `primitives/`: Módulos matemáticos internos (aritmética polinomial, Transformación Teórica de Números - NTT, empaquetado de bits y muestreo).
     *   `arbol_dependencias_mldsa.md`: Documentación detallada del orden matemático y dependencias de la biblioteca criptográfica.
-*   `tests/`: Suite completa de pruebas unitarias dividida por componentes matemáticos y criptográficos.
+*   `tests/`: Suite completa de pruebas unitarias dividida por componentes matemáticos, criptográficos y de integración (`test_api.py`).
 *   `requirements.txt`: Dependencias de librerías Python necesarias.
 
 ---

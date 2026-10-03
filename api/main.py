@@ -1,27 +1,35 @@
 import os
 import sys
 
-# Permitir importar módulos desde el directorio raíz (como 'mldsa')
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Asegurar que el directorio raíz del proyecto esté en sys.path para resolución limpia de paquetes ('mldsa', 'api')
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import base64
 import jwt
 from datetime import timedelta
+from typing import Annotated, List, Optional
 from dotenv import load_dotenv
+
 load_dotenv()  # Cargar .env ANTES de cualquier os.environ.get()
-from fastapi import FastAPI, Depends, UploadFile, File, Form, HTTPException, Security, Request
-from pydantic import BaseModel
+
+from fastapi import FastAPI, Depends, UploadFile, HTTPException, Security, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client, ClientOptions
-from typing import Annotated, List
 
 from mldsa.mldsa import keygen, hash_sign, hash_verify, hash_sign_digest, hash_verify_digest
 
-app = FastAPI()
+app = FastAPI(
+    title="Q-Proof Dilithium ML-DSA API",
+    description="API de firma y verificación post-cuántica ML-DSA (FIPS 204)",
+    version="1.0.0"
+)
 
 # Rate limiting
 limiter = Limiter(key_func=get_remote_address)
@@ -90,12 +98,11 @@ async def get_current_user(credentials: Annotated[HTTPAuthorizationCredentials, 
         payload = jwt.decode(
             token,
             key=signing_key.key,
-            algorithms=["ES256", "RS256"], #Mirar esto
+            algorithms=["ES256", "RS256"],
             audience="authenticated",
             leeway=timedelta(seconds=10)  # Tolera hasta 10s de desincronización de reloj
         )
-        # DEVOLVEMOS AMBAS COSAS AQUÍ
-        return {"payload": payload, "token": token} 
+        return {"payload": payload, "token": token}
         
     except jwt.ExpiredSignatureError as e:
         print(f"[AUTH DEBUG] Token expirado: {str(e)}")
@@ -111,13 +118,14 @@ async def get_current_user(credentials: Annotated[HTTPAuthorizationCredentials, 
         raise HTTPException(status_code=500, detail="Internal authentication error")
 
 @app.post("/api/generate")
-async def generate_keys(auth_data: dict = Depends(get_current_user)):
+@limiter.limit("10/minute")
+async def generate_keys(request: Request, auth_data: dict = Depends(get_current_user)):
     try:
         payload = auth_data["payload"]
         token = auth_data["token"]
         
         user_id = payload.get("sub")
-        email = payload.get("email") # Extraemos el email del token
+        email = payload.get("email")  # Extraemos el email del token
         if not user_id:
             raise HTTPException(status_code=401, detail="Token missing subject claim")
             
@@ -164,13 +172,18 @@ def parse_hash_to_bytes(hash_str: str) -> bytes:
         detail="Invalid document_hash format. Must be a 64-character hex string or 32-byte Base64 string."
     )
 
+# --- Esquemas Pydantic formales para peticiones JSON ---
+
 class SignHashRequest(BaseModel):
-    document_hash: str
+    document_hash: str = Field(
+        ...,
+        description="Hash SHA-256 en formato hexadecimal (64 caracteres) o Base64 (32 bytes)"
+    )
 
 class VerifyHashRequest(BaseModel):
-    document_hash: str
-    signature_b64: str
-    public_key: str
+    document_hash: str = Field(..., description="Hash SHA-256 del documento")
+    signature_b64: str = Field(..., description="Firma digital ML-DSA en Base64")
+    public_key: str = Field(..., description="Clave pública ML-DSA del firmante en Base64")
 
 class SignatureValidationItem(BaseModel):
     layer: int
@@ -181,32 +194,261 @@ class SignatureValidationItem(BaseModel):
 class BatchVerifyRequest(BaseModel):
     validations: List[SignatureValidationItem]
 
-@app.post("/api/sign")
+# --- Clases de Dominio e Inyección de Dependencias para Entradas Híbridas ---
+
+class SignPayload:
+    """Contenedor de datos de entrada desacoplado para /api/sign."""
+    def __init__(self, document_hash: Optional[str] = None, file_bytes: Optional[bytes] = None):
+        self.document_hash = document_hash
+        self.file_bytes = file_bytes
+
+async def get_sign_payload(request: Request) -> SignPayload:
+    """
+    Dependencia limpia para extraer datos de /api/sign tanto si vienen por
+    JSON como por multipart/form-data, manteniendo estricta retrocompatibilidad.
+    """
+    content_type = request.headers.get("content-type", "").lower()
+
+    # 1. Petición JSON puro
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            validated = SignHashRequest.model_validate(body)
+            return SignPayload(document_hash=validated.document_hash)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Invalid JSON payload: {str(e)}")
+
+    # 2. Petición multipart/form-data o form-urlencoded
+    if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+        form = await request.form()
+        file_item = form.get("file")
+        doc_hash = form.get("document_hash")
+
+        file_bytes = None
+        if hasattr(file_item, "read"):
+            file_bytes = await file_item.read()
+        elif isinstance(file_item, bytes):
+            file_bytes = file_item
+
+        target_hash = str(doc_hash).strip() if (doc_hash is not None and not hasattr(doc_hash, "read")) else None
+        if not target_hash and not file_bytes:
+            raise HTTPException(status_code=400, detail="Either 'document_hash' or 'file' must be provided.")
+
+        return SignPayload(document_hash=target_hash, file_bytes=file_bytes)
+
+    # 3. Fallback defensivo para clientes con Content-Type ausente o alternativo
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and "document_hash" in body:
+            validated = SignHashRequest.model_validate(body)
+            return SignPayload(document_hash=validated.document_hash)
+    except Exception:
+        pass
+
+    try:
+        form = await request.form()
+        file_item = form.get("file")
+        doc_hash = form.get("document_hash")
+        file_bytes = await file_item.read() if hasattr(file_item, "read") else None
+        target_hash = str(doc_hash).strip() if (doc_hash is not None and not hasattr(doc_hash, "read")) else None
+        if target_hash or file_bytes:
+            return SignPayload(document_hash=target_hash, file_bytes=file_bytes)
+    except Exception:
+        pass
+
+    raise HTTPException(status_code=400, detail="Either 'document_hash' or 'file' must be provided.")
+
+
+class VerifyPayload:
+    """Contenedor de datos de entrada desacoplado para /api/verify."""
+    def __init__(
+        self,
+        public_key_b64: str,
+        document_hash: Optional[str] = None,
+        signature_bytes: Optional[bytes] = None,
+        file_bytes: Optional[bytes] = None
+    ):
+        self.public_key_b64 = public_key_b64
+        self.document_hash = document_hash
+        self.signature_bytes = signature_bytes
+        self.file_bytes = file_bytes
+
+async def get_verify_payload(request: Request) -> VerifyPayload:
+    """
+    Dependencia limpia para extraer datos de /api/verify tanto si vienen por
+    JSON como por multipart/form-data, manteniendo estricta retrocompatibilidad.
+    """
+    content_type = request.headers.get("content-type", "").lower()
+
+    # 1. Petición JSON puro
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+            validated = VerifyHashRequest.model_validate(body)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Invalid JSON payload: {str(e)}")
+
+        if not validated.public_key:
+            raise HTTPException(status_code=400, detail="Missing public_key")
+        if not validated.signature_b64:
+            raise HTTPException(status_code=400, detail="Missing signature or signature_b64")
+        if not validated.document_hash:
+            raise HTTPException(status_code=400, detail="Either 'document_hash' or 'file' must be provided.")
+
+        try:
+            sig_bytes = base64.b64decode(validated.signature_b64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid Base64 signature_b64")
+
+        return VerifyPayload(
+            public_key_b64=validated.public_key,
+            document_hash=validated.document_hash,
+            signature_bytes=sig_bytes
+        )
+
+    # 2. Petición multipart/form-data o form-urlencoded
+    if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+        form = await request.form()
+        public_key = form.get("public_key")
+        document_hash = form.get("document_hash")
+        signature_b64 = form.get("signature_b64")
+        file_item = form.get("file")
+        sig_item = form.get("signature")
+
+        target_pk = str(public_key).strip() if (public_key is not None and not hasattr(public_key, "read")) else None
+        target_hash = str(document_hash).strip() if (document_hash is not None and not hasattr(document_hash, "read")) else None
+        target_sig_b64 = str(signature_b64).strip() if (signature_b64 is not None and not hasattr(signature_b64, "read")) else None
+
+        if not target_pk:
+            raise HTTPException(status_code=400, detail="Missing public_key")
+
+        sig_bytes = None
+        if target_sig_b64:
+            try:
+                sig_bytes = base64.b64decode(target_sig_b64)
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid Base64 signature_b64")
+        elif hasattr(sig_item, "read"):
+            sig_bytes = await sig_item.read()
+        elif isinstance(sig_item, bytes):
+            sig_bytes = sig_item
+        else:
+            raise HTTPException(status_code=400, detail="Missing signature or signature_b64")
+
+        file_bytes = None
+        if hasattr(file_item, "read"):
+            file_bytes = await file_item.read()
+        elif isinstance(file_item, bytes):
+            file_bytes = file_item
+
+        if not target_hash and not file_bytes:
+            raise HTTPException(status_code=400, detail="Either 'document_hash' or 'file' must be provided.")
+
+        return VerifyPayload(
+            public_key_b64=target_pk,
+            document_hash=target_hash,
+            signature_bytes=sig_bytes,
+            file_bytes=file_bytes
+        )
+
+    # 3. Fallback defensivo JSON
+    try:
+        body = await request.json()
+        validated = VerifyHashRequest.model_validate(body)
+        sig_bytes = base64.b64decode(validated.signature_b64)
+        return VerifyPayload(
+            public_key_b64=validated.public_key,
+            document_hash=validated.document_hash,
+            signature_bytes=sig_bytes
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Missing required verification parameters or invalid format")
+
+
+# --- Configuración OpenAPI para Documentación Interactiva en Swagger UI ---
+
+sign_openapi_extra = {
+    "requestBody": {
+        "content": {
+            "application/json": {
+                "schema": SignHashRequest.model_json_schema()
+            },
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "file": {
+                            "type": "string",
+                            "format": "binary",
+                            "description": "Documento PDF a firmar digitalmente"
+                        },
+                        "document_hash": {
+                            "type": "string",
+                            "description": "Hash hexadecimal de 64 caracteres o Base64 de 32 bytes (alternativa a subir archivo)"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+verify_openapi_extra = {
+    "requestBody": {
+        "content": {
+            "application/json": {
+                "schema": VerifyHashRequest.model_json_schema()
+            },
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "public_key": {
+                            "type": "string",
+                            "description": "Clave pública del firmante en Base64"
+                        },
+                        "document_hash": {
+                            "type": "string",
+                            "description": "Hash SHA-256 del documento"
+                        },
+                        "signature_b64": {
+                            "type": "string",
+                            "description": "Firma digital en Base64"
+                        },
+                        "file": {
+                            "type": "string",
+                            "format": "binary",
+                            "description": "Archivo PDF original"
+                        },
+                        "signature": {
+                            "type": "string",
+                            "format": "binary",
+                            "description": "Archivo binario de firma (.sig)"
+                        }
+                    },
+                    "required": ["public_key"]
+                }
+            }
+        }
+    }
+}
+
+
+@app.post("/api/sign", openapi_extra=sign_openapi_extra)
+@limiter.limit("10/minute")
 async def sign_document(
     request: Request,
-    token_payload: dict = Depends(get_current_user),
-    file: UploadFile | None = File(None),
-    document_hash: str | None = Form(None)
+    payload: SignPayload = Depends(get_sign_payload),
+    auth_data: dict = Depends(get_current_user)
 ):
     try:
-        user_id = token_payload["payload"].get("sub")
-        token = token_payload["token"]
+        user_id = auth_data["payload"].get("sub")
+        token = auth_data["token"]
         
         if not user_id:
             raise HTTPException(status_code=401, detail="Token missing subject claim")
-
-        # Intentar obtener document_hash desde JSON si no viene por Form/File
-        target_hash = document_hash
-        if not target_hash and not file:
-            try:
-                body = await request.json()
-                if isinstance(body, dict):
-                    target_hash = body.get("document_hash")
-            except Exception:
-                pass
-
-        if not target_hash and not file:
-            raise HTTPException(status_code=400, detail="Either 'document_hash' or 'file' must be provided.")
             
         # Inyecta seguridad: cliente autenticado de Supabase para RLS
         options = ClientOptions(headers={"Authorization": f"Bearer {token}"})
@@ -219,12 +461,13 @@ async def sign_document(
         private_key = res.data["private_key"]
         sk_bytes = base64.b64decode(private_key)
         
-        if target_hash:
-            ph_m = parse_hash_to_bytes(target_hash)
+        if payload.document_hash:
+            ph_m = parse_hash_to_bytes(payload.document_hash)
             signature_bytes = hash_sign_digest(sk=sk_bytes, ph_m=ph_m, ph_algo="SHA-256", ctx=b"Q-Proof")
+        elif payload.file_bytes:
+            signature_bytes = hash_sign(sk=sk_bytes, M=payload.file_bytes, ph_algo="SHA-256", ctx=b"Q-Proof")
         else:
-            pdf_bytes = await file.read()
-            signature_bytes = hash_sign(sk=sk_bytes, M=pdf_bytes, ph_algo="SHA-256", ctx=b"Q-Proof")
+            raise HTTPException(status_code=400, detail="Either 'document_hash' or 'file' must be provided.")
             
         signature_b64 = base64.b64encode(signature_bytes).decode('utf-8')
         return {"signature_b64": signature_b64}
@@ -236,50 +479,35 @@ async def sign_document(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/verify")
+@app.post("/api/verify", openapi_extra=verify_openapi_extra)
 @limiter.limit("10/minute")
 async def verify_document(
     request: Request,
-    file: UploadFile | None = File(None),
-    signature: UploadFile | None = File(None),
-    public_key: str | None = Form(None),
-    document_hash: str | None = Form(None),
-    signature_b64: str | None = Form(None)
+    payload: VerifyPayload = Depends(get_verify_payload)
 ):
     try:
-        target_hash = document_hash
-        target_sig_b64 = signature_b64
-        target_pk_b64 = public_key
+        try:
+            pk_bytes = base64.b64decode(payload.public_key_b64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid Base64 public_key")
 
-        # Intentar obtener campos desde JSON si no vienen por Form
-        if not target_hash and not file:
-            try:
-                body = await request.json()
-                if isinstance(body, dict):
-                    target_hash = body.get("document_hash", target_hash)
-                    target_sig_b64 = body.get("signature_b64", target_sig_b64)
-                    target_pk_b64 = body.get("public_key", target_pk_b64)
-            except Exception:
-                pass
-
-        if not target_pk_b64:
-            raise HTTPException(status_code=400, detail="Missing public_key")
-
-        pk_bytes = base64.b64decode(target_pk_b64)
-
-        if target_sig_b64:
-            signature_bytes = base64.b64decode(target_sig_b64)
-        elif signature:
-            signature_bytes = await signature.read()
-        else:
-            raise HTTPException(status_code=400, detail="Missing signature or signature_b64")
-
-        if target_hash:
-            ph_m = parse_hash_to_bytes(target_hash)
-            is_valid = hash_verify_digest(pk=pk_bytes, ph_m=ph_m, sigma=signature_bytes, ph_algo="SHA-256", ctx=b"Q-Proof")
-        elif file:
-            pdf_bytes = await file.read()
-            is_valid = hash_verify(pk=pk_bytes, M=pdf_bytes, sigma=signature_bytes, ph_algo="SHA-256", ctx=b"Q-Proof")
+        if payload.document_hash:
+            ph_m = parse_hash_to_bytes(payload.document_hash)
+            is_valid = hash_verify_digest(
+                pk=pk_bytes,
+                ph_m=ph_m,
+                sigma=payload.signature_bytes,
+                ph_algo="SHA-256",
+                ctx=b"Q-Proof"
+            )
+        elif payload.file_bytes:
+            is_valid = hash_verify(
+                pk=pk_bytes,
+                M=payload.file_bytes,
+                sigma=payload.signature_bytes,
+                ph_algo="SHA-256",
+                ctx=b"Q-Proof"
+            )
         else:
             raise HTTPException(status_code=400, detail="Either 'document_hash' or 'file' must be provided.")
 
@@ -342,6 +570,11 @@ async def verify_batch(request: Request, body: BatchVerifyRequest):
 
     return {"results": results}
 
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    # Si se ejecuta directamente el archivo, asegurar que la raíz del proyecto esté en sys.path
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    uvicorn.run("api.main:app", host="127.0.0.1", port=8000, reload=True)
