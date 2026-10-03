@@ -1,21 +1,23 @@
-# ==========================================
-# Q-Proof System - Dependencias del Proyecto
-# ==========================================
+# ==============================================================================
+# Q-Proof System - Dependencias del Proyecto (ML-DSA FIPS 204 + ML-KEM FIPS 203)
+# ==============================================================================
 
-# --- Criptografía Básica (KDF, AES-GCM vía Fernet) ---
-# Se utiliza para derivación de contraseñas y cifrado de claves locales
+# --- Criptografía Primitiva & Híbrida (AES-256-GCM, Hash, KDF) ---
 cryptography>=42.0.0
 
-# --- Criptografía Post-Cuántica (ML-DSA / FIPS 204) ---
-# (Implementación local en el módulo 'mldsa', basada
-# --- Backend API (FastAPI) ---
+# --- Framework Backend API REST ---
 fastapi>=0.109.2
 uvicorn>=0.27.0
 python-multipart>=0.0.9
-PyJWT>=2.8.0
-supabase>=2.3.4
 slowapi>=0.1.9
+pydantic>=2.6.0
 
-# --- Gestión de Entorno (Credenciales Seguras) ---
+# --- Autenticación y Base de Datos (Supabase, JWT con soporte criptográfico) ---
+supabase>=2.3.4
+pyjwt[crypto]>=2.8.0
+
+# --- Gestión de Entorno y Variables ---
 python-dotenv>=1.0.0
 
+# --- Cliente HTTP Asíncrono para Testing e Integración ---
+httpx>=0.26.0
